@@ -44,42 +44,16 @@ def _get_index_name() -> str:
     return os.environ.get("PINECONE_INDEX", "koi-memories")
 
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=3),
-    retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.ConnectError, asyncio.TimeoutError)),
-    reraise=True,
-)
 async def _embed_text(text: str) -> list[float]:
     """
-    Embed text using Sarvam's embedding endpoint.
+    Embed text into a 1024-dimensional vector.
 
-    Returns a 1024-dimensional float vector.
-    Falls back to a simple hash-based vector if the API fails.
+    Sarvam AI does not currently offer a dedicated embedding endpoint,
+    so we use a deterministic hash-based embedding for MVP.
+    This is sufficient for basic memory retrieval and can be swapped
+    for a real embedding model later.
     """
-    api_key = os.environ.get("SARVAM_API_KEY", "")
-    if not api_key:
-        logger.warning("SARVAM_API_KEY not set, using fallback embedding")
-        return _fallback_embed(text)
-
-    async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
-        resp = await client.post(
-            f"{SARVAM_BASE_URL}/embed",
-            json={"model": "sarvam-embed", "input": [text]},
-            headers={
-                "api-subscription-key": api_key,
-                "Content-Type": "application/json",
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        embeddings = data.get("data", [])
-        if embeddings and "embedding" in embeddings[0]:
-            return embeddings[0]["embedding"]
-
-        logger.warning("Unexpected embedding response shape, using fallback")
-        return _fallback_embed(text)
+    return _fallback_embed(text)
 
 
 def _fallback_embed(text: str) -> list[float]:

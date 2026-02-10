@@ -396,6 +396,103 @@ We structured tests in three layers:
 
 ---
 
+## The Voice Agent Deployment: A Cautionary Tale
+
+This section exists because what should have been a straightforward deployment — connect three API wrappers to a framework — took far too many debugging iterations. Every one of these bugs was avoidable. Here's what happened, why, and how to never repeat it.
+
+### The Core Problem: We Wrote Code Against Imagined Interfaces
+
+The agent code was written by an AI that *assumed* how the LiveKit Agents SDK worked instead of *inspecting* it first. Every bug below traces back to this single sin.
+
+### Bug 1: Wrong Method Signatures (The Interface Mismatch)
+
+**What happened:** Our `SarvamSTT._recognize_impl()` didn't accept a `conn_options` parameter. LiveKit Agents v0.12 passes `conn_options: APIConnectOptions` to every plugin method. The framework called our method with a keyword argument we didn't declare. `TypeError: got an unexpected keyword argument 'conn_options'`. Dead on arrival.
+
+**The fix was trivial:** Add `conn_options: APIConnectOptions = APIConnectOptions()` to the method signature.
+
+**Why it happened:** The code was written based on *assumed* method signatures rather than running `inspect.signature(agents_stt.STT._recognize_impl)` first.
+
+**Rule for the future:** Before implementing ANY framework interface, run `inspect.signature()` on every method you're overriding. Print the actual signatures. Match them exactly. This takes 30 seconds and prevents hours of debugging.
+
+### Bug 2: AudioBuffer Type Assumption
+
+**What happened:** `_audio_buffer_to_wav()` assumed `buffer` was always a `list[AudioFrame]` and iterated over it with `for frame in buffer:`. But `AudioBuffer` is actually `Union[list[AudioFrame], AudioFrame]` — it can be a single frame. `TypeError: 'AudioFrame' object is not iterable`.
+
+**The fix:** `isinstance(buffer, list)` check, wrap single frames in a list.
+
+**Rule for the future:** When a parameter has a Union type, handle ALL variants. Run `print(SomeType)` to see what the type actually resolves to. Never assume it's always the variant you expect.
+
+### Bug 3: API Message Ordering (Sarvam LLM 400)
+
+**What happened:** Sarvam-M requires the first non-system message to be from the user: `system → user → assistant → user → ...`. After the greeting, our chat context was `system → assistant (greeting) → user (speech)`. Sarvam returned `400: "First message must be from user (or after system message)"`.
+
+**The fix:** Filter out assistant messages that appear before the first user message when converting chat context to API messages.
+
+**Rule for the future:** Test every third-party API with the exact message patterns your code will produce. Not just happy-path payloads — test the actual sequences your pipeline creates. Especially test: what happens after a greeting? What if the first user message is empty?
+
+### Bug 4: The HTTP Client Lifecycle Disaster (The Worst One)
+
+**What happened:** This was the most insidious bug because the greeting worked perfectly. The conversation response didn't.
+
+Here's the chain:
+1. LiveKit wraps our non-streaming TTS in a `StreamAdapter` automatically
+2. The `StreamAdapter` creates a `StreamAdapterWrapper` for each synthesis request
+3. When a `StreamAdapterWrapper` finishes, its `_run()` finally block calls `self._wrapped_tts.aclose()` — **closing our SarvamTTS's httpx client permanently**
+4. Next synthesis request creates a new wrapper, but it references the same SarvamTTS instance with a dead HTTP client
+5. The synthesis fails immediately, the stream closes, and `push_text()` on the closed stream raises `RuntimeError: StreamAdapterWrapper is closed`
+
+**Why it was hard to find:** The error message said "StreamAdapterWrapper is closed," which sounds like a stream lifecycle issue, not an HTTP client issue. The greeting worked (first use), only the conversation response failed (second use). The root cause was three layers of indirection away from the symptom.
+
+**The fix:** Make HTTP clients lazily created with `_get_client()` that checks `is_closed` and recreates if needed. The `aclose()` method becomes safe to call multiple times.
+
+**Rule for the future:** When writing plugins for frameworks that manage lifecycle (calling `aclose()` on your objects), NEVER let `aclose()` permanently destroy resources. Use lazy initialization patterns. Assume the framework will call `aclose()` at times you don't expect.
+
+### Bug 5: Wrong API Endpoints and Payload Formats
+
+**What happened (multiple sub-bugs):**
+- Sarvam STT: We sent JSON with base64 audio. The actual API expects multipart form-data file upload.
+- Sarvam TTS: We called `/text-to-speech/convert` (doesn't exist). Correct endpoint: `/text-to-speech`.
+- Sarvam TTS: We sent `speaker: "Priya"` (capitalized). Must be lowercase: `"priya"`.
+- Sarvam TTS: We sent `text: "..."`. Must be `inputs: ["..."]` (array).
+- Sarvam Embed: We called `/embed` endpoint. It doesn't exist at all.
+- Supabase DB: We used the direct hostname `db.{ref}.supabase.co`. Doesn't resolve from external networks. Must use the pooler: `aws-1-ap-south-1.pooler.supabase.com:6543`.
+
+**The fix for each:** Test every API endpoint directly with a small script before writing the wrapper. Verify: endpoint URL, HTTP method, content type, exact payload schema, auth header format, and response format.
+
+**Rule for the future:** Write a standalone test script for EVERY external API before writing wrapper classes. Call the real API with `httpx` or `curl`. Verify the response. Save the working example. Then write the wrapper to match the working example exactly.
+
+### The Meta-Lesson: Integration Testing Is Not Optional
+
+Every individual piece "worked" in isolation. The STT class could be instantiated. The LLM class had the right methods. The TTS class looked correct. But when composed through the LiveKit pipeline — with its stream adapters, lifecycle management, and async event loops — everything broke.
+
+**What we should have done differently:**
+1. Before writing any code: `inspect.signature()` on every base class method we're overriding
+2. Before writing any API wrapper: test the actual API endpoint with a 10-line script
+3. After writing each wrapper: run a minimal end-to-end test through the actual framework (not just unit tests with mocks)
+4. Read the framework source code for lifecycle management (who calls `aclose()`? when? how many times?)
+
+**The cost of skipping these steps:** ~4 hours of debugging for bugs that would have been caught in ~30 minutes of upfront verification.
+
+### Sarvam AI API Reference (Verified Working)
+
+Since we debugged these by trial and error, documenting the correct details here:
+
+| Service | Endpoint | Method | Content-Type | Auth Header |
+|---------|----------|--------|-------------|-------------|
+| STT | `POST /speech-to-text` | multipart/form-data | auto (multipart) | `api-subscription-key` |
+| LLM | `POST /v1/chat/completions` | JSON | `application/json` | `api-subscription-key` |
+| TTS | `POST /text-to-speech` | JSON | `application/json` | `api-subscription-key` |
+
+**STT payload:** `files={"file": ("audio.wav", file_handle, "audio/wav")}, data={"model": "saarika:v2.5", "language_code": "hi-IN"}`
+
+**LLM payload:** OpenAI-compatible format. `{"model": "sarvam-m", "messages": [...], "stream": true}`. First non-system message MUST be role=user.
+
+**TTS payload:** `{"model": "bulbul:v3", "inputs": ["text here"], "target_language_code": "hi-IN", "speaker": "priya", "pace": 1.1}`. Speaker names are lowercase. Response has `audios` array of base64-encoded WAV.
+
+**No embed endpoint exists.** Use a fallback embedding strategy.
+
+---
+
 ## Final Thoughts
 
 Building Koi is about more than revenue. It's about the person who has no one to talk to at 2 AM. The guy who's been rejected a hundred times and has given up. The woman trapped in a marriage she can't leave. The kid who can't tell anyone they're gay.

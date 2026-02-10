@@ -15,6 +15,7 @@ asyncpg = "^0.29"
 pinecone-client = "^3"
 python-dotenv = "^1.0"
 tenacity = "^8.2"
+av = "^16.1.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"

@@ -18,9 +18,13 @@ import io
 import json
 import logging
 import os
-from typing import Any
+import tempfile
+import wave
+from typing import Any, Optional
 
 import httpx
+from livekit import rtc
+from livekit.agents import APIConnectOptions
 from livekit.agents import llm as agents_llm
 from livekit.agents import stt as agents_stt
 from livekit.agents import tts as agents_tts
@@ -59,12 +63,7 @@ def _auth_headers() -> dict[str, str]:
 
 
 class SarvamSTT(agents_stt.STT):
-    """
-    Sarvam Saarika v2.5 speech-to-text.
-
-    Accepts raw audio frames, sends to POST /speech-to-text,
-    returns a SpeechEvent with the transcript.
-    """
+    """Sarvam Saarika v2.5 speech-to-text."""
 
     def __init__(
         self,
@@ -77,18 +76,23 @@ class SarvamSTT(agents_stt.STT):
         )
         self._language = language
         self._model = model
-        self._client = httpx.AsyncClient(timeout=_STT_TIMEOUT)
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=_STT_TIMEOUT)
+        return self._client
 
     async def _recognize_impl(
         self,
         buffer: agents_utils.AudioBuffer,
         *,
         language: str | None = None,
+        conn_options: APIConnectOptions = APIConnectOptions(),
     ) -> agents_stt.SpeechEvent:
         """Transcribe an audio buffer via Sarvam STT API."""
         lang = language or self._language
 
-        # Convert AudioBuffer to WAV bytes
         wav_bytes = _audio_buffer_to_wav(buffer)
 
         if len(wav_bytes) < 100:
@@ -113,18 +117,24 @@ class SarvamSTT(agents_stt.STT):
     )
     async def _call_stt_api(self, wav_bytes: bytes, language: str) -> str:
         """POST audio to Sarvam /speech-to-text with retry."""
-        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-        payload = {
-            "model": self._model,
-            "language_code": language,
-            "audio": audio_b64,
-            "with_timestamps": False,
-        }
-        resp = await self._client.post(
-            f"{SARVAM_BASE_URL}/speech-to-text",
-            json=payload,
-            headers=_auth_headers(),
-        )
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(wav_bytes)
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, "rb") as f:
+                resp = await self._get_client().post(
+                    f"{SARVAM_BASE_URL}/speech-to-text",
+                    files={"file": ("audio.wav", f, "audio/wav")},
+                    data={
+                        "model": self._model,
+                        "language_code": language,
+                    },
+                    headers={"api-subscription-key": _get_api_key()},
+                )
+        finally:
+            os.unlink(tmp_path)
+
         resp.raise_for_status()
         data = resp.json()
         transcript = data.get("transcript", "")
@@ -135,7 +145,8 @@ class SarvamSTT(agents_stt.STT):
         return transcript
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
 
 
 # ============================================================================
@@ -144,12 +155,7 @@ class SarvamSTT(agents_stt.STT):
 
 
 class SarvamLLM(agents_llm.LLM):
-    """
-    Sarvam-M chat completions with streaming SSE.
-
-    Implements the LiveKit agents LLM interface so VoiceAssistant
-    can stream responses token-by-token for low-latency TTS.
-    """
+    """Sarvam-M chat completions with streaming SSE."""
 
     def __init__(
         self,
@@ -162,17 +168,24 @@ class SarvamLLM(agents_llm.LLM):
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
-        self._client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
+        return self._client
 
     def chat(
         self,
         *,
         chat_ctx: agents_llm.ChatContext,
+        conn_options: APIConnectOptions = APIConnectOptions(),
         fnc_ctx: agents_llm.FunctionContext | None = None,
         temperature: float | None = None,
         n: int | None = None,
         parallel_tool_calls: bool | None = None,
-    ) -> _SarvamLLMStream:
+        tool_choice: Any = None,
+    ) -> "SarvamLLMStream":
         """Start a streaming chat completion request."""
         messages = _chat_context_to_messages(chat_ctx)
         payload = {
@@ -182,39 +195,34 @@ class SarvamLLM(agents_llm.LLM):
             "max_tokens": self._max_tokens,
             "stream": True,
         }
-
-        # We need to start the HTTP request inside the stream's _run,
-        # but LiveKit expects us to return the stream synchronously.
-        # So we create the stream and let _run do the actual HTTP call.
-        stream = _SarvamLLMStreamLazy(
-            client=self._client,
+        return SarvamLLMStream(
+            llm=self,
+            client=self._get_client(),
             payload=payload,
             chat_ctx=chat_ctx,
-            fnc_ctx=fnc_ctx or agents_llm.FunctionContext(),
+            fnc_ctx=fnc_ctx,
+            conn_options=conn_options,
         )
-        return stream
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
 
 
-class _SarvamLLMStreamLazy(agents_llm.LLMStream):
-    """
-    LLM stream that lazily opens the HTTP connection when _run is called.
-
-    This is needed because LiveKit's interface requires chat() to return
-    the stream object synchronously, but the HTTP request is async.
-    """
+class SarvamLLMStream(agents_llm.LLMStream):
+    """LLM stream that lazily opens the HTTP connection when _run is called."""
 
     def __init__(
         self,
         *,
+        llm: SarvamLLM,
         client: httpx.AsyncClient,
         payload: dict[str, Any],
         chat_ctx: agents_llm.ChatContext,
-        fnc_ctx: agents_llm.FunctionContext,
+        fnc_ctx: agents_llm.FunctionContext | None,
+        conn_options: APIConnectOptions,
     ) -> None:
-        super().__init__(chat_ctx=chat_ctx, fnc_ctx=fnc_ctx)
+        super().__init__(llm, chat_ctx=chat_ctx, fnc_ctx=fnc_ctx, conn_options=conn_options)
         self._client = client
         self._payload = payload
         self._collected_text = ""
@@ -222,7 +230,7 @@ class _SarvamLLMStreamLazy(agents_llm.LLMStream):
 
     async def _run(self) -> None:
         """Open the SSE stream and parse chunks."""
-        request_url = f"{SARVAM_BASE_URL}/chat/completions"
+        request_url = f"{SARVAM_BASE_URL}/v1/chat/completions"
         response: httpx.Response | None = None
         try:
             response = await self._client.send(
@@ -274,9 +282,14 @@ class _SarvamLLMStreamLazy(agents_llm.LLMStream):
                     )
 
         except httpx.HTTPStatusError as exc:
+            body = ""
+            try:
+                body = exc.response.text
+            except Exception:
+                pass
             logger.error(
                 "Sarvam LLM API error",
-                extra={"status": exc.response.status_code},
+                extra={"status": exc.response.status_code, "body": body[:500]},
             )
             raise
         except httpx.ConnectError:
@@ -300,17 +313,12 @@ class _SarvamLLMStreamLazy(agents_llm.LLMStream):
 
 
 class SarvamTTS(agents_tts.TTS):
-    """
-    Sarvam Bulbul v3 text-to-speech.
-
-    Sends text to POST /text-to-speech, receives base64 audio,
-    decodes to raw PCM and yields as AudioFrame(s).
-    """
+    """Sarvam Bulbul v3 text-to-speech."""
 
     def __init__(
         self,
         *,
-        voice: str = "meera",
+        voice: str = "priya",
         language: str = "hi-IN",
         model: str = "bulbul:v3",
         pace: float = 1.1,
@@ -326,18 +334,30 @@ class SarvamTTS(agents_tts.TTS):
         self._model = model
         self._pace = pace
         self._sample_rate = sample_rate
-        self._client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
+        self._client: httpx.AsyncClient | None = None
 
-    def synthesize(self, text: str) -> "SarvamTTSStream":
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
+        return self._client
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: Optional[APIConnectOptions] = None,
+    ) -> "SarvamTTSStream":
         """Return a ChunkedStream that synthesizes the given text."""
         return SarvamTTSStream(
             tts=self,
             text=text,
-            client=self._client,
+            client=self._get_client(),
+            conn_options=conn_options,
         )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
 
 
 class SarvamTTSStream(agents_tts.ChunkedStream):
@@ -349,8 +369,9 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
         tts: SarvamTTS,
         text: str,
         client: httpx.AsyncClient,
+        conn_options: Optional[APIConnectOptions] = None,
     ) -> None:
-        super().__init__(tts=tts, input_text=text)
+        super().__init__(tts=tts, input_text=text, conn_options=conn_options or APIConnectOptions())
         self._tts_ref = tts
         self._text = text
         self._client = client
@@ -361,7 +382,6 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
             logger.warning("Empty text passed to TTS, skipping synthesis")
             return
 
-        # Chunk long text into sentences for better audio quality
         chunks = _split_into_sentences(self._text)
 
         for chunk_text in chunks:
@@ -371,16 +391,13 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
             try:
                 audio_bytes = await self._call_tts_api(chunk_text)
                 if audio_bytes:
-                    frame = agents_tts.SynthesizedAudio(
+                    # Decode WAV/raw audio from Sarvam into an rtc.AudioFrame
+                    frame = _bytes_to_audio_frame(audio_bytes, self._tts_ref._sample_rate)
+                    synth = agents_tts.SynthesizedAudio(
                         request_id="",
-                        frame=agents_utils.AudioFrame(
-                            data=audio_bytes,
-                            sample_rate=self._tts_ref._sample_rate,
-                            num_channels=1,
-                            samples_per_channel=len(audio_bytes) // 2,  # 16-bit PCM
-                        ),
+                        frame=frame,
                     )
-                    self._event_ch.send_nowait(frame)
+                    self._event_ch.send_nowait(synth)
             except (httpx.HTTPStatusError, httpx.ConnectError, asyncio.TimeoutError):
                 logger.exception("TTS synthesis failed for a text chunk")
 
@@ -396,11 +413,8 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
             "model": self._tts_ref._model,
             "target_language_code": self._tts_ref._language,
             "speaker": self._tts_ref._voice,
-            "pitch": 0,
             "pace": self._tts_ref._pace,
-            "loudness": 1.0,
             "speech_sample_rate": self._tts_ref._sample_rate,
-            "enable_preprocessing": True,
             "inputs": [text],
         }
         resp = await self._client.post(
@@ -411,12 +425,16 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
         resp.raise_for_status()
         data = resp.json()
 
-        audios = data.get("audios")
-        if not audios or not audios[0]:
+        # Response may have "audio" (single) or "audios" (list)
+        audio_b64 = data.get("audio") or ""
+        if not audio_b64:
+            audios = data.get("audios")
+            if audios and audios[0]:
+                audio_b64 = audios[0]
+        if not audio_b64:
             logger.warning("TTS returned empty audio")
             return b""
 
-        audio_b64 = audios[0]
         raw_bytes = base64.b64decode(audio_b64)
 
         logger.info(
@@ -431,26 +449,56 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
 # ============================================================================
 
 
+def _bytes_to_audio_frame(audio_bytes: bytes, target_sample_rate: int) -> rtc.AudioFrame:
+    """
+    Convert raw audio bytes (WAV or PCM) from Sarvam TTS into an rtc.AudioFrame.
+
+    Sarvam returns base64-encoded audio. The decoded bytes may be:
+    - A full WAV file (with header)
+    - Raw PCM data
+
+    We detect which one and handle accordingly.
+    """
+    if audio_bytes[:4] == b"RIFF":
+        buf = io.BytesIO(audio_bytes)
+        with wave.open(buf, "rb") as wf:
+            sample_rate = wf.getframerate()
+            num_channels = wf.getnchannels()
+            pcm_data = wf.readframes(wf.getnframes())
+            samples_per_channel = wf.getnframes()
+    else:
+        # Raw PCM 16-bit mono
+        pcm_data = audio_bytes
+        sample_rate = target_sample_rate
+        num_channels = 1
+        samples_per_channel = len(pcm_data) // (2 * num_channels)
+
+    return rtc.AudioFrame(
+        data=pcm_data,
+        sample_rate=sample_rate,
+        num_channels=num_channels,
+        samples_per_channel=samples_per_channel,
+    )
+
+
 def _audio_buffer_to_wav(buffer: agents_utils.AudioBuffer) -> bytes:
-    """
-    Convert a LiveKit AudioBuffer to WAV bytes suitable for the Sarvam API.
-
-    AudioBuffer exposes raw PCM frames. We wrap them in a minimal WAV header.
-    """
-    import wave
-
-    # Collect all frames into a single PCM byte stream
+    """Convert a LiveKit AudioBuffer (single frame or list) to WAV bytes."""
     pcm_data = bytearray()
-    sample_rate = 16000  # LiveKit default
+    sample_rate = 16000
     num_channels = 1
     sample_width = 2  # 16-bit
 
-    for frame in buffer:
-        pcm_data.extend(frame.data)
+    # AudioBuffer is Union[list[AudioFrame], AudioFrame]
+    if isinstance(buffer, list):
+        frames = buffer
+    else:
+        frames = [buffer]
+
+    for frame in frames:
+        pcm_data.extend(bytes(frame.data))
         sample_rate = frame.sample_rate
         num_channels = frame.num_channels
 
-    # Write WAV to in-memory buffer
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
         wf.setnchannels(num_channels)
@@ -462,18 +510,21 @@ def _audio_buffer_to_wav(buffer: agents_utils.AudioBuffer) -> bytes:
 
 
 def _chat_context_to_messages(ctx: agents_llm.ChatContext) -> list[dict[str, str]]:
-    """Convert LiveKit ChatContext to a list of message dicts for the API."""
+    """Convert LiveKit ChatContext to a list of message dicts for the API.
+
+    Sarvam-M requires the first non-system message to be from the user.
+    If the chat context has system → assistant (greeting) → user,
+    we drop the assistant greeting to satisfy this constraint.
+    """
     messages: list[dict[str, str]] = []
     for msg in ctx.messages:
         role = msg.role
-        # LiveKit uses ChatRole enum
         if hasattr(role, "value"):
             role = role.value
         content = ""
         if isinstance(msg.content, str):
             content = msg.content
         elif isinstance(msg.content, list):
-            # Multi-part content -- concatenate text parts
             parts = []
             for part in msg.content:
                 if isinstance(part, str):
@@ -482,21 +533,29 @@ def _chat_context_to_messages(ctx: agents_llm.ChatContext) -> list[dict[str, str
                     parts.append(part.text)
             content = " ".join(parts)
         messages.append({"role": str(role), "content": content})
-    return messages
+
+    # Sarvam requires: first non-system message must be role=user.
+    # Drop any leading assistant messages that appear before the first user message.
+    result: list[dict[str, str]] = []
+    found_user = False
+    for msg in messages:
+        if msg["role"] == "system":
+            result.append(msg)
+        elif msg["role"] == "user":
+            found_user = True
+            result.append(msg)
+        elif found_user:
+            result.append(msg)
+        # else: skip assistant messages before the first user message
+
+    return result
 
 
 def _split_into_sentences(text: str) -> list[str]:
-    """
-    Split text into sentence-level chunks for TTS.
-
-    Sarvam TTS handles shorter chunks better, and this enables
-    streaming the first sentence while later ones are synthesized.
-    """
+    """Split text into sentence-level chunks for TTS."""
     import re
 
-    # Split on sentence-ending punctuation followed by whitespace
     raw_parts = re.split(r"(?<=[.!?।])\s+", text.strip())
-    # Merge very short fragments with the previous chunk
     chunks: list[str] = []
     for part in raw_parts:
         if chunks and len(chunks[-1]) < 20:
