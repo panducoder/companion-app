@@ -23,6 +23,8 @@ interface AuthState {
 
   initialize: () => Promise<void>;
   setSession: (session: Session | null) => void;
+  sendOtp: (phone: string) => Promise<void>;
+  verifyOtp: (phone: string, token: string) => Promise<void>;
   fetchProfile: () => Promise<void>;
   updateProfile: (updates: Partial<UserProfile>) => Promise<void>;
   signOut: () => Promise<void>;
@@ -60,6 +62,35 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       user: session?.user ?? null,
       isOnboarded: false,
     });
+  },
+
+  sendOtp: async (phone) => {
+    try {
+      set({ error: null });
+      const { error } = await supabase.auth.signInWithOtp({ phone });
+      if (error) throw error;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to send OTP';
+      set({ error: message });
+      throw err;
+    }
+  },
+
+  verifyOtp: async (phone, token) => {
+    try {
+      set({ error: null });
+      const { error } = await supabase.auth.verifyOtp({
+        phone,
+        token,
+        type: 'sms',
+      });
+      if (error) throw error;
+      // Session will be set via onAuthStateChange listener in App.tsx
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Invalid code';
+      set({ error: message });
+      throw err;
+    }
   },
 
   fetchProfile: async () => {

@@ -1,3 +1,20 @@
+// delete-user-data/index.ts
+// Cascading deletion of all user data: messages -> conversations -> pinecone -> profile -> auth user.
+//
+// Required env vars (set via Supabase Dashboard > Edge Functions > Secrets):
+//   SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
+//   PINECONE_API_KEY, PINECONE_HOST (optional -- skipped if not set)
+//
+// IMPORTANT: The secret must be named SUPABASE_SERVICE_ROLE_KEY (not SUPABASE_SERVICE_KEY).
+//   supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
+//
+// Deployment:
+//   1. Install Supabase CLI: brew install supabase/tap/supabase
+//   2. Link project:  supabase link --project-ref vkybqfcadvgiuhrkugrb
+//   3. Set secrets:   supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<key> \
+//                       PINECONE_API_KEY=<key> PINECONE_HOST=<host>
+//   4. Deploy:        supabase functions deploy delete-user-data
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 

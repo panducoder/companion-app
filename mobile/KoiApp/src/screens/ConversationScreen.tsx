@@ -3,110 +3,109 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Animated, { FadeIn, FadeInUp } from 'react-native-reanimated';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import {
+  LiveKitRoom,
+  useConnectionState,
+  useLocalParticipant,
+  useVoiceAssistant,
+} from '@livekit/react-native';
+import { ConnectionState, Track } from 'livekit-client';
+import { AudioSession } from '@livekit/react-native';
 import { colors } from '../theme/colors';
 import { typography } from '../theme/typography';
 import { spacing } from '../theme/spacing';
 import { haptic } from '../utils/haptics';
-import { configureAudioSession } from '../utils/permissions';
 import { VoiceOrb } from '../components/VoiceOrb';
 import { TranscriptBubble } from '../components/TranscriptBubble';
 import { CallControls } from '../components/CallControls';
 import { useAuthStore } from '../stores/authStore';
-import { createSession, type OrbState } from '../services/livekit';
+import { createSession, type LiveKitSession, type OrbState } from '../services/livekit';
 import type { RootStackParamList } from '../../App';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Conversation'>;
 
-const STATUS_LABELS: Record<OrbState, string> = {
-  idle: 'Ready',
-  connecting: 'Connecting...',
-  listening: 'Listening...',
-  speaking: '',
-  error: 'Connection lost. Reconnecting...',
-};
+function mapAgentStateToOrb(
+  agentState: string,
+  connectionState: ConnectionState,
+): OrbState {
+  if (connectionState !== ConnectionState.Connected) {
+    return 'connecting';
+  }
+  switch (agentState) {
+    case 'speaking':
+      return 'speaking';
+    case 'listening':
+      return 'listening';
+    case 'thinking':
+      return 'listening';
+    case 'initializing':
+    case 'connecting':
+    case 'pre-connect-buffering':
+      return 'connecting';
+    case 'disconnected':
+    case 'failed':
+      return 'error';
+    default:
+      return 'idle';
+  }
+}
 
-export function ConversationScreen({ navigation }: Props) {
+/** Inner component rendered inside LiveKitRoom context */
+function ConversationContent({
+  onEndCall,
+  companionName,
+}: {
+  onEndCall: () => void;
+  companionName: string;
+}) {
   const insets = useSafeAreaInsets();
-  const { profile } = useAuthStore();
-  const companionName = profile?.companion_name ?? 'Koi';
+  const connectionState = useConnectionState();
+  const { localParticipant, isMicrophoneEnabled } = useLocalParticipant();
+  const voiceAssistant = useVoiceAssistant();
 
-  const [orbState, setOrbState] = useState<OrbState>('connecting');
-  const [isMuted, setIsMuted] = useState(false);
   const [lastTranscript, setLastTranscript] = useState('');
   const [lastTranscriptRole, setLastTranscriptRole] = useState<'user' | 'assistant'>('assistant');
-  const [sessionInfo, setSessionInfo] = useState<{
-    token: string;
-    url: string;
-    roomName: string;
-    conversationId: string;
-  } | null>(null);
 
-  const isDisconnecting = useRef(false);
+  const orbState = mapAgentStateToOrb(voiceAssistant.state, connectionState);
+  const isMuted = !isMicrophoneEnabled;
 
-  const connectToRoom = useCallback(async () => {
-    try {
-      setOrbState('connecting');
-      await configureAudioSession();
-
-      const session = await createSession();
-      setSessionInfo(session);
-
-      // In a real integration, here we would connect to the LiveKit room
-      // using the LiveKitRoom component. For now, we simulate the flow:
-      // After getting the token, transition to listening state.
-      haptic.success();
-      setOrbState('listening');
-
-      // Simulated agent join after a delay
-      // In production, this is driven by LiveKit participant events
-      setTimeout(() => {
-        if (!isDisconnecting.current) {
-          setOrbState('speaking');
-          setLastTranscript(`Hey! Good to hear from you.`);
-          setLastTranscriptRole('assistant');
-
-          setTimeout(() => {
-            if (!isDisconnecting.current) {
-              setOrbState('listening');
-            }
-          }, 3000);
-        }
-      }, 2000);
-    } catch (err) {
-      haptic.error();
-      setOrbState('error');
-
-      // Retry after 3 seconds
-      setTimeout(() => {
-        if (!isDisconnecting.current) {
-          connectToRoom();
-        }
-      }, 3000);
-    }
-  }, []);
-
+  // Track agent transcriptions
   useEffect(() => {
-    connectToRoom();
+    if (voiceAssistant.agentTranscriptions.length > 0) {
+      const latest = voiceAssistant.agentTranscriptions[voiceAssistant.agentTranscriptions.length - 1];
+      if (latest?.text) {
+        setLastTranscript(latest.text);
+        setLastTranscriptRole('assistant');
+      }
+    }
+  }, [voiceAssistant.agentTranscriptions]);
 
-    return () => {
-      isDisconnecting.current = true;
-    };
-  }, [connectToRoom]);
+  // Haptic on connect
+  useEffect(() => {
+    if (connectionState === ConnectionState.Connected) {
+      haptic.success();
+    }
+  }, [connectionState]);
 
-  const handleToggleMute = () => {
-    setIsMuted((prev) => !prev);
-    // In production: toggle microphone track publication
-    // room.localParticipant.setMicrophoneEnabled(!isMuted);
-  };
+  const handleToggleMute = useCallback(() => {
+    localParticipant.setMicrophoneEnabled(isMicrophoneEnabled ? false : true);
+  }, [localParticipant, isMicrophoneEnabled]);
 
-  const handleEndCall = () => {
-    isDisconnecting.current = true;
+  const handleEndCall = useCallback(() => {
     haptic.heavy();
-    // In production: disconnect from LiveKit room, end conversation in DB
-    navigation.goBack();
-  };
+    onEndCall();
+  }, [onEndCall]);
 
-  const statusLabel = orbState === 'speaking' ? companionName : STATUS_LABELS[orbState];
+  const statusLabel =
+    orbState === 'speaking'
+      ? companionName
+      : orbState === 'connecting'
+        ? 'Connecting...'
+        : orbState === 'listening'
+          ? 'Listening...'
+          : orbState === 'error'
+            ? 'Connection lost. Reconnecting...'
+            : 'Ready';
 
   return (
     <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
@@ -121,11 +120,13 @@ export function ConversationScreen({ navigation }: Props) {
         >
           <Text style={styles.backText}>Back</Text>
         </Pressable>
-        {sessionInfo && (
-          <Text style={styles.roomIndicator}>
-            {orbState === 'error' ? 'Reconnecting' : 'Connected'}
-          </Text>
-        )}
+        <Text style={styles.roomIndicator}>
+          {connectionState === ConnectionState.Connected
+            ? 'Connected'
+            : connectionState === ConnectionState.Reconnecting
+              ? 'Reconnecting'
+              : 'Connecting'}
+        </Text>
       </View>
 
       {/* Center orb area */}
@@ -164,10 +165,138 @@ export function ConversationScreen({ navigation }: Props) {
   );
 }
 
+export function ConversationScreen({ navigation }: Props) {
+  const { profile } = useAuthStore();
+  const companionName = profile?.companion_name ?? 'Koi';
+
+  const [session, setSession] = useState<LiveKitSession | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const isDisconnecting = useRef(false);
+
+  // Configure audio session and fetch token on mount
+  useEffect(() => {
+    let cancelled = false;
+
+    async function init() {
+      try {
+        // Configure iOS audio session for voice call
+        await AudioSession.configureAudio({
+          android: {
+            audioTypeOptions: {
+              manageAudioFocus: true,
+              audioMode: 'inCommunication',
+              audioStreamType: 'voiceCall',
+              audioFocusMode: 'gain',
+              audioAttributesUsageType: 'voiceCommunication',
+              audioAttributesContentType: 'speech',
+            },
+          },
+          ios: {
+            defaultOutput: 'speaker',
+          },
+        });
+        await AudioSession.startAudioSession();
+
+        const lkSession = await createSession();
+        if (!cancelled) {
+          setSession(lkSession);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSessionError(
+            err instanceof Error ? err.message : 'Unable to start conversation. Please try again.',
+          );
+          haptic.error();
+        }
+      }
+    }
+
+    init();
+
+    return () => {
+      cancelled = true;
+      isDisconnecting.current = true;
+      AudioSession.stopAudioSession();
+    };
+  }, []);
+
+  const handleEndCall = useCallback(() => {
+    isDisconnecting.current = true;
+    navigation.goBack();
+  }, [navigation]);
+
+  const handleRoomError = useCallback(
+    (error: Error) => {
+      if (!isDisconnecting.current) {
+        setSessionError(error.message);
+        haptic.error();
+      }
+    },
+    [],
+  );
+
+  const handleDisconnected = useCallback(() => {
+    if (!isDisconnecting.current) {
+      // Unexpected disconnect -- go back
+      haptic.warning();
+      navigation.goBack();
+    }
+  }, [navigation]);
+
+  // Show error state
+  if (sessionError && !session) {
+    return (
+      <View style={[styles.container, styles.centerContent]}>
+        <Text style={styles.errorText}>{sessionError}</Text>
+        <Pressable
+          onPress={() => {
+            haptic.light();
+            navigation.goBack();
+          }}
+        >
+          <Text style={styles.backText}>Go Back</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  // Show loading state while getting token
+  if (!session) {
+    return (
+      <View style={[styles.container, styles.centerContent]}>
+        <VoiceOrb state="connecting" size={180} />
+        <Text style={[styles.companionName, { marginTop: spacing.md }]}>Connecting...</Text>
+      </View>
+    );
+  }
+
+  return (
+    <LiveKitRoom
+      serverUrl={session.url}
+      token={session.token}
+      connect={true}
+      audio={true}
+      video={false}
+      onError={handleRoomError}
+      onDisconnected={handleDisconnected}
+    >
+      <ConversationContent
+        onEndCall={handleEndCall}
+        companionName={companionName}
+      />
+    </LiveKitRoom>
+  );
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.bg.primary,
+  },
+  centerContent: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.md,
   },
   topBar: {
     flexDirection: 'row',
@@ -207,5 +336,11 @@ const styles = StyleSheet.create({
     minHeight: 80,
     justifyContent: 'flex-end',
     paddingBottom: spacing.sm,
+  },
+  errorText: {
+    ...typography.body,
+    color: colors.status.error,
+    textAlign: 'center',
+    paddingHorizontal: spacing.lg,
   },
 });

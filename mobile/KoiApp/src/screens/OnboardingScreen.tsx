@@ -22,7 +22,6 @@ import { typography } from '../theme/typography';
 import { spacing, borderRadius } from '../theme/spacing';
 import { haptic } from '../utils/haptics';
 import { useAuthStore } from '../stores/authStore';
-import { supabase } from '../services/supabase';
 import type { RootStackParamList } from '../../App';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Onboarding'>;
@@ -40,7 +39,7 @@ export function OnboardingScreen({ navigation }: Props) {
   const [otpSent, setOtpSent] = useState(false);
 
   const otpRef = useRef<TextInput>(null);
-  const { fetchProfile, updateProfile } = useAuthStore();
+  const { sendOtp: storeSendOtp, verifyOtp: storeVerifyOtp, fetchProfile, updateProfile } = useAuthStore();
 
   const handleGetStarted = () => {
     haptic.light();
@@ -58,8 +57,7 @@ export function OnboardingScreen({ navigation }: Props) {
 
     try {
       const fullPhone = `+91${phone.replace(/\D/g, '').slice(-10)}`;
-      const { error: authError } = await supabase.auth.signInWithOtp({ phone: fullPhone });
-      if (authError) throw authError;
+      await storeSendOtp(fullPhone);
       setOtpSent(true);
       setTimeout(() => otpRef.current?.focus(), 300);
     } catch (err) {
@@ -80,13 +78,7 @@ export function OnboardingScreen({ navigation }: Props) {
 
     try {
       const fullPhone = `+91${phone.replace(/\D/g, '').slice(-10)}`;
-      const { error: authError } = await supabase.auth.verifyOtp({
-        phone: fullPhone,
-        token: otp,
-        type: 'sms',
-      });
-      if (authError) throw authError;
-
+      await storeVerifyOtp(fullPhone, otp);
       await fetchProfile();
       haptic.success();
       setStep('personalize');

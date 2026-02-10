@@ -4,7 +4,7 @@ export interface RoomTokenResponse {
   token: string;
   url: string;
   roomName: string;
-  conversationId: string;
+  conversationId: string | null;
 }
 
 export interface Conversation {

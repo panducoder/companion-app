@@ -36,6 +36,15 @@ from tenacity import (
     wait_exponential,
 )
 
+from src.observability import (
+    create_llm_generation,
+    create_stt_span,
+    create_tts_span,
+    end_llm_generation,
+    end_stt_span,
+    end_tts_span,
+)
+
 logger = logging.getLogger("koi.agent.sarvam")
 
 SARVAM_BASE_URL = "https://api.sarvam.ai"
@@ -77,6 +86,7 @@ class SarvamSTT(agents_stt.STT):
         self._language = language
         self._model = model
         self._client: httpx.AsyncClient | None = None
+        self._trace: Any = None  # Langfuse trace, set externally
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -102,7 +112,16 @@ class SarvamSTT(agents_stt.STT):
                 alternatives=[agents_stt.SpeechData(text="", language=lang)],
             )
 
+        span = create_stt_span(
+            self._trace,
+            audio_size_bytes=len(wav_bytes),
+            language=lang,
+            model=self._model,
+        )
+
         transcript = await self._call_stt_api(wav_bytes, lang)
+
+        end_stt_span(span, transcript=transcript, language=lang)
 
         return agents_stt.SpeechEvent(
             type=agents_stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -169,6 +188,7 @@ class SarvamLLM(agents_llm.LLM):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._client: httpx.AsyncClient | None = None
+        self._trace: Any = None  # Langfuse trace, set externally
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -195,6 +215,17 @@ class SarvamLLM(agents_llm.LLM):
             "max_tokens": self._max_tokens,
             "stream": True,
         }
+
+        generation = create_llm_generation(
+            self._trace,
+            messages=messages,
+            model=self._model,
+            model_parameters={
+                "temperature": payload["temperature"],
+                "max_tokens": self._max_tokens,
+            },
+        )
+
         return SarvamLLMStream(
             llm=self,
             client=self._get_client(),
@@ -202,6 +233,7 @@ class SarvamLLM(agents_llm.LLM):
             chat_ctx=chat_ctx,
             fnc_ctx=fnc_ctx,
             conn_options=conn_options,
+            langfuse_generation=generation,
         )
 
     async def aclose(self) -> None:
@@ -221,12 +253,14 @@ class SarvamLLMStream(agents_llm.LLMStream):
         chat_ctx: agents_llm.ChatContext,
         fnc_ctx: agents_llm.FunctionContext | None,
         conn_options: APIConnectOptions,
+        langfuse_generation: Any = None,
     ) -> None:
         super().__init__(llm, chat_ctx=chat_ctx, fnc_ctx=fnc_ctx, conn_options=conn_options)
         self._client = client
         self._payload = payload
         self._collected_text = ""
         self._request_id = ""
+        self._langfuse_generation = langfuse_generation
 
     async def _run(self) -> None:
         """Open the SSE stream and parse chunks."""
@@ -298,6 +332,12 @@ class SarvamLLMStream(agents_llm.LLMStream):
         finally:
             if response is not None:
                 await response.aclose()
+
+            end_llm_generation(
+                self._langfuse_generation,
+                output_text=self._collected_text,
+            )
+
             logger.info(
                 "LLM stream finished",
                 extra={
@@ -335,6 +375,7 @@ class SarvamTTS(agents_tts.TTS):
         self._pace = pace
         self._sample_rate = sample_rate
         self._client: httpx.AsyncClient | None = None
+        self._trace: Any = None  # Langfuse trace, set externally
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -353,6 +394,7 @@ class SarvamTTS(agents_tts.TTS):
             text=text,
             client=self._get_client(),
             conn_options=conn_options,
+            langfuse_trace=self._trace,
         )
 
     async def aclose(self) -> None:
@@ -370,11 +412,13 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
         text: str,
         client: httpx.AsyncClient,
         conn_options: Optional[APIConnectOptions] = None,
+        langfuse_trace: Any = None,
     ) -> None:
         super().__init__(tts=tts, input_text=text, conn_options=conn_options or APIConnectOptions())
         self._tts_ref = tts
         self._text = text
         self._client = client
+        self._langfuse_trace = langfuse_trace
 
     async def _run(self) -> None:
         """Synthesize text and emit audio frames."""
@@ -382,7 +426,16 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
             logger.warning("Empty text passed to TTS, skipping synthesis")
             return
 
+        span = create_tts_span(
+            self._langfuse_trace,
+            text=self._text,
+            model=self._tts_ref._model,
+            voice=self._tts_ref._voice,
+            language=self._tts_ref._language,
+        )
+
         chunks = _split_into_sentences(self._text)
+        total_audio_bytes = 0
 
         for chunk_text in chunks:
             if not chunk_text.strip():
@@ -391,6 +444,7 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
             try:
                 audio_bytes = await self._call_tts_api(chunk_text)
                 if audio_bytes:
+                    total_audio_bytes += len(audio_bytes)
                     # Decode WAV/raw audio from Sarvam into an rtc.AudioFrame
                     frame = _bytes_to_audio_frame(audio_bytes, self._tts_ref._sample_rate)
                     synth = agents_tts.SynthesizedAudio(
@@ -400,6 +454,8 @@ class SarvamTTSStream(agents_tts.ChunkedStream):
                     self._event_ch.send_nowait(synth)
             except (httpx.HTTPStatusError, httpx.ConnectError, asyncio.TimeoutError):
                 logger.exception("TTS synthesis failed for a text chunk")
+
+        end_tts_span(span, audio_size_bytes=total_audio_bytes)
 
     @retry(
         stop=stop_after_attempt(2),

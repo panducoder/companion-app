@@ -42,6 +42,12 @@ from src.db.client import (
 from src.memory.retriever import get_relevant
 from src.memory.storage import store_conversation
 from src.persona.prompts import build_context
+from src.observability import (
+    create_session_trace,
+    flush as langfuse_flush,
+    init_langfuse,
+    shutdown_langfuse,
+)
 from src.services.sarvam import SarvamLLM, SarvamSTT, SarvamTTS
 
 # ---------------------------------------------------------------------------
@@ -64,11 +70,13 @@ load_dotenv()
 async def _on_process_start() -> None:
     """Called once when the worker process starts."""
     logger.info("Koi agent worker process starting")
+    init_langfuse()
 
 
 async def _on_process_shutdown() -> None:
     """Called when the worker process is shutting down."""
     logger.info("Koi agent worker process shutting down")
+    shutdown_langfuse()
     await close_pool()
 
 
@@ -138,6 +146,19 @@ async def entrypoint(ctx: JobContext) -> None:
     conversation_id = await _safe_create_conversation(user_id)
 
     # -----------------------------------------------------------------------
+    # Create Langfuse session trace
+    # -----------------------------------------------------------------------
+    trace = create_session_trace(
+        session_id=ctx.room.name,
+        user_id=user_id,
+        metadata={
+            "user_name": user_name,
+            "companion_name": companion_name,
+            "conversation_id": conversation_id or "",
+        },
+    )
+
+    # -----------------------------------------------------------------------
     # Assemble the voice pipeline
     # -----------------------------------------------------------------------
     initial_ctx = agents_llm.ChatContext()
@@ -146,6 +167,11 @@ async def entrypoint(ctx: JobContext) -> None:
     stt = SarvamSTT()
     llm_instance = SarvamLLM()
     tts = SarvamTTS()
+
+    # Wire Langfuse trace to service instances
+    stt._trace = trace
+    llm_instance._trace = trace
+    tts._trace = trace
     vad = silero.VAD.load()
 
     assistant = VoiceAssistant(
@@ -216,6 +242,9 @@ async def entrypoint(ctx: JobContext) -> None:
             asyncio.ensure_future(
                 _safe_store_conversation_memory(user_id, conversation_messages)
             )
+
+        # Flush Langfuse traces before closing HTTP clients
+        langfuse_flush()
 
         # Close Sarvam HTTP clients
         await stt.aclose()

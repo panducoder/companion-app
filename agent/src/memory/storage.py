@@ -12,14 +12,13 @@ Designed to run as a background task so it doesn't block the voice pipeline.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any
 from uuid import uuid4
 
 import httpx
-from pinecone import Pinecone
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -78,13 +77,19 @@ async def _summarize_conversation(messages: list[dict[str, str]]) -> dict[str, s
         transcript_lines.append(f"{role}: {content}")
     transcript = "\n".join(transcript_lines)
 
+    # Sarvam-M requires the first non-system message to be from user role.
+    # Use system for instructions, user for the transcript to summarize.
     payload = {
         "model": "sarvam-m",
         "messages": [
             {
                 "role": "system",
-                "content": _SUMMARIZE_PROMPT + transcript,
-            }
+                "content": _SUMMARIZE_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": transcript,
+            },
         ],
         "temperature": 0.3,
         "max_tokens": 200,
@@ -93,7 +98,7 @@ async def _summarize_conversation(messages: list[dict[str, str]]) -> dict[str, s
 
     async with httpx.AsyncClient(timeout=_LLM_TIMEOUT) as client:
         resp = await client.post(
-            f"{SARVAM_BASE_URL}/chat/completions",
+            f"{SARVAM_BASE_URL}/v1/chat/completions",
             json=payload,
             headers={
                 "api-subscription-key": api_key,
@@ -104,9 +109,6 @@ async def _summarize_conversation(messages: list[dict[str, str]]) -> dict[str, s
         data = resp.json()
 
     raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-    # Parse JSON from the LLM response
-    import json
 
     try:
         result = json.loads(raw_content)
