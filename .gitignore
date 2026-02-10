@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+
+# Expo / React Native
+mobile/KoiApp/.expo/
+mobile/KoiApp/ios/Pods/
+mobile/KoiApp/android/.gradle/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build
+build/

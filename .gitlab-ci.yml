@@ -1,0 +1,212 @@
+# Koi App - GitLab CI/CD Pipeline
+# Monorepo: Python agent + React Native app + Supabase Edge Functions
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+variables:
+  PYTHON_IMAGE: python:3.11-slim
+  NODE_IMAGE: node:20-alpine
+  DENO_IMAGE: denoland/deno:1.40.0
+
+# ============================================================================
+# TEMPLATES
+# ============================================================================
+
+.python_changes:
+  rules:
+    - changes:
+        - agent/**/*
+        - .gitlab-ci.yml
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - agent/**/*
+
+.mobile_changes:
+  rules:
+    - changes:
+        - mobile/**/*
+        - .gitlab-ci.yml
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - mobile/**/*
+
+.supabase_changes:
+  rules:
+    - changes:
+        - supabase/**/*
+        - .gitlab-ci.yml
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - supabase/**/*
+
+# ============================================================================
+# STAGE: LINT
+# ============================================================================
+
+lint:python:
+  stage: lint
+  image: $PYTHON_IMAGE
+  extends: .python_changes
+  before_script:
+    - pip install --quiet black ruff mypy
+  script:
+    - cd agent
+    - black --check --line-length=100 src/ tests/
+    - ruff check src/ tests/
+    - mypy src/ --ignore-missing-imports --no-error-summary || true
+  allow_failure: false
+
+lint:mobile:
+  stage: lint
+  image: $NODE_IMAGE
+  extends: .mobile_changes
+  before_script:
+    - cd mobile/KoiApp && npm ci --prefer-offline
+  script:
+    - npx eslint src/ --ext .ts,.tsx --max-warnings 0
+    - npx prettier --check "src/**/*.{ts,tsx}"
+    - npx tsc --noEmit
+
+lint:supabase:
+  stage: lint
+  image: $DENO_IMAGE
+  extends: .supabase_changes
+  script:
+    - cd supabase
+    - deno lint functions/
+    - deno fmt --check functions/
+
+# ============================================================================
+# STAGE: TEST
+# ============================================================================
+
+test:python:unit:
+  stage: test
+  image: $PYTHON_IMAGE
+  extends: .python_changes
+  before_script:
+    - pip install --quiet poetry
+    - cd agent && poetry install --no-interaction
+  script:
+    - cd agent
+    - poetry run pytest tests/unit/ -v --cov=src --cov-report=xml --cov-report=term --cov-fail-under=75
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: agent/coverage.xml
+    when: always
+
+test:python:integration:
+  stage: test
+  image: $PYTHON_IMAGE
+  extends: .python_changes
+  services:
+    - postgres:15-alpine
+  variables:
+    POSTGRES_DB: koi_test
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: "postgresql://test:test@postgres:5432/koi_test"
+  before_script:
+    - pip install --quiet poetry
+    - cd agent && poetry install --no-interaction
+  script:
+    - cd agent
+    - poetry run pytest tests/integration/ -v --timeout=30
+
+test:mobile:unit:
+  stage: test
+  image: $NODE_IMAGE
+  extends: .mobile_changes
+  before_script:
+    - cd mobile/KoiApp && npm ci --prefer-offline
+  script:
+    - cd mobile/KoiApp
+    - npx jest --coverage --ci --reporters=default --reporters=jest-junit
+  coverage: '/Lines\s*:\s*([\d.]+)%/'
+  artifacts:
+    reports:
+      junit: mobile/KoiApp/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: mobile/KoiApp/coverage/cobertura-coverage.xml
+    when: always
+
+test:supabase:functions:
+  stage: test
+  image: $DENO_IMAGE
+  extends: .supabase_changes
+  script:
+    - cd supabase
+    - deno test --allow-env --allow-net tests/ --coverage=coverage
+    - deno coverage coverage --lcov --output=coverage.lcov
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: supabase/coverage.lcov
+    when: always
+
+# ============================================================================
+# STAGE: BUILD
+# ============================================================================
+
+build:agent:docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -f agent/Dockerfile -t $CI_REGISTRY_IMAGE/agent:$CI_COMMIT_SHORT_SHA agent/
+    - docker push $CI_REGISTRY_IMAGE/agent:$CI_COMMIT_SHORT_SHA
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag $CI_REGISTRY_IMAGE/agent:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE/agent:latest
+        docker push $CI_REGISTRY_IMAGE/agent:latest
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - agent/**/*
+    - if: $CI_COMMIT_BRANCH == "develop"
+      changes:
+        - agent/**/*
+    - if: $CI_COMMIT_TAG
+
+# ============================================================================
+# STAGE: DEPLOY
+# ============================================================================
+
+deploy:agent:staging:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Deploy agent image $CI_REGISTRY_IMAGE/agent:$CI_COMMIT_SHORT_SHA to staging"
+    # Replace with actual deployment command (Railway, Fly.io, etc.)
+  environment:
+    name: staging
+    url: https://staging.koi-app.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      changes:
+        - agent/**/*
+
+deploy:agent:production:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Deploy agent image $CI_REGISTRY_IMAGE/agent:$CI_COMMIT_SHORT_SHA to production"
+  environment:
+    name: production
+    url: https://koi-app.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  when: manual
