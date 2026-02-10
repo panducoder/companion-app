@@ -1,0 +1,50 @@
+# Koi App - Local Development Docker Compose
+# Usage: docker compose up
+#
+# Starts the voice agent container alongside a local Postgres DB
+# for development and integration testing.
+#
+# Supabase local dev is managed via `supabase start` (Supabase CLI)
+# and runs its own Docker containers, so it is NOT included here.
+
+services:
+  # Voice Agent (Python + LiveKit)
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: koi-agent
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./agent/src:/app/src:ro
+
+  # Local Postgres for integration tests and standalone agent dev
+  postgres:
+    image: postgres:15-alpine
+    container_name: koi-postgres
+    environment:
+      POSTGRES_DB: koi
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "54322:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./supabase/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

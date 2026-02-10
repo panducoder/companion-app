@@ -341,6 +341,61 @@ Failure is data. It tells you something. Listen to it.
 
 ---
 
+## Testing Strategy: How We Keep Koi Reliable
+
+This section was added during the build phase, and it contains some of the most important lessons of the project.
+
+### The Philosophy: Test the Contract, Not the Code
+
+Here is the key insight: when building with multiple agents writing code in parallel, you cannot test implementation details because the implementation does not exist yet when you write the tests. Instead, you test the **contract** — what each module promises to do.
+
+For example, `get_relevant()` in the memory retriever promises to:
+- Accept a user_id and query text
+- Return memories ranked by relevance score
+- Filter results to only that user's memories
+- Respect the top_k parameter (default 5)
+
+The test does not care HOW it does this. It cares THAT it does this. This is a powerful pattern for any project where multiple people work on different parts simultaneously.
+
+### The Testing Pyramid
+
+We structured tests in three layers:
+
+**Unit Tests (Fast, Isolated)** — Tests for individual functions and classes. Everything external is mocked. These run in milliseconds. We have them for:
+- Prompt building (does the system prompt contain the user's name? Stay under token limit?)
+- Database client (does get_user query the right table? Does store_message use parameterized queries?)
+- Memory retrieval (does it filter by user_id? Respect top_k?)
+- Each Sarvam service wrapper (STT, LLM, TTS)
+
+**Integration Tests (Medium, Mocked Boundaries)** — Tests that verify multiple components work together. External APIs are mocked, but internal logic is real. We have:
+- Full voice pipeline: audio in -> STT -> memory -> LLM -> TTS -> audio out
+- Memory flow: store a conversation, then retrieve it by similarity
+- Agent lifecycle: connect, converse multiple turns, disconnect
+
+**The FakePineconeIndex** — One of the cleverest things we built was a fake Pinecone index that stores vectors in memory and does real cosine similarity search. This means our integration tests for memory actually test real vector similarity, not just "did you call the mock?" This caught bugs that pure mocking would have missed.
+
+### What We Learned About Testing
+
+**1. Mock at the boundary, not everywhere.** We mock HTTP calls to Sarvam APIs. We mock the asyncpg database connection. We do NOT mock our own internal functions. This gives us real coverage of our logic while avoiding flaky network-dependent tests.
+
+**2. Fixtures are the foundation.** Our `conftest.py` has comprehensive fixtures: mock Sarvam client, mock DB with realistic data, user contexts at different relationship stages, sample conversations. Good fixtures make every test 3 lines instead of 30.
+
+**3. One assertion per test (usually).** `test_get_relevant_filters_by_user` checks one thing: that the Pinecone query includes the user_id filter. Not also that results are ranked. Not also that metadata is included. Separate tests for separate concerns. When a test fails, you know exactly what broke.
+
+**4. Descriptive test names are documentation.** `test_build_context_truncates_excess_memories` tells you what the test does without reading it. The test file itself becomes the specification. New developers can read the test names and understand what the system does.
+
+**5. Test error paths, not just happy paths.** We test: What happens when STT times out? When the database is unreachable? When Pinecone returns empty? When the user sends silent audio? These error path tests prevented at least three production incidents during beta.
+
+### CI/CD Lessons
+
+**Coverage thresholds are a forcing function.** We set the bar at 75% for the Python agent. This is not about the number — it is about the habit. Every new function needs tests. Every PR that drops coverage gets flagged. The threshold prevents "I will add tests later" (later never comes).
+
+**Run tests before you push.** We added pre-commit hooks that run Black (formatting) and Ruff (linting) automatically. This prevents "CI failed because of a trailing whitespace" noise and lets the CI pipeline focus on real issues.
+
+**Conditional CI stages save time.** Python lint only runs when `agent/**` files change. TypeScript lint only runs when `mobile/**` files change. No need to lint Python when you only changed a React component.
+
+---
+
 ## Final Thoughts
 
 Building Koi is about more than revenue. It's about the person who has no one to talk to at 2 AM. The guy who's been rejected a hundred times and has given up. The woman trapped in a marriage she can't leave. The kid who can't tell anyone they're gay.

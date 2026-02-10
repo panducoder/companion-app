@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Koi",
+    "slug": "koi-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "koi",
+    "icon": "./assets/icon.png",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0A1A"
+    },
+    "ios": {
+      "bundleIdentifier": "com.koi.companion",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Koi needs access to your microphone so you can have voice conversations.",
+        "UIBackgroundModes": ["audio"]
+      }
+    },
+    "android": {
+      "package": "com.koi.companion",
+      "permissions": ["RECORD_AUDIO"],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0A0A1A"
+      },
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [],
+    "extra": {
+      "SUPABASE_URL": "${process.env.EXPO_PUBLIC_SUPABASE_URL}",
+      "SUPABASE_ANON_KEY": "${process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY}",
+      "LIVEKIT_URL": "${process.env.EXPO_PUBLIC_LIVEKIT_URL}"
+    }
+  }
+}

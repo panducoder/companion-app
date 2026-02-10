@@ -1,0 +1,182 @@
+# Koi App - PR Required Checks
+# These checks must pass before a PR can be merged
+
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # DETECT CHANGES
+  # ============================================================================
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      agent: ${{ steps.filter.outputs.agent }}
+      mobile: ${{ steps.filter.outputs.mobile }}
+      supabase: ${{ steps.filter.outputs.supabase }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            agent:
+              - 'agent/**'
+            mobile:
+              - 'mobile/**'
+            supabase:
+              - 'supabase/**'
+
+  # ============================================================================
+  # PYTHON CHECKS
+  # ============================================================================
+  python-lint:
+    needs: changes
+    if: needs.changes.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install black ruff mypy
+      - name: black
+        run: black --check --line-length=100 agent/src/ agent/tests/
+      - name: ruff
+        run: ruff check agent/src/ agent/tests/
+      - name: mypy
+        run: mypy agent/src/ --ignore-missing-imports
+
+  python-test:
+    needs: changes
+    if: needs.changes.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: snok/install-poetry@v1
+        with:
+          version: "1.8.2"
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+      - name: Cache venv
+        uses: actions/cache@v4
+        with:
+          path: agent/.venv
+          key: venv-${{ runner.os }}-py3.11-${{ hashFiles('agent/poetry.lock') }}
+      - name: Install
+        working-directory: agent
+        run: poetry install --no-interaction
+      - name: Test with coverage
+        working-directory: agent
+        run: |
+          poetry run pytest tests/ -v \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-fail-under=75
+
+  # ============================================================================
+  # TYPESCRIPT CHECKS
+  # ============================================================================
+  typescript-lint:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile/KoiApp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: mobile/KoiApp/package-lock.json
+      - run: npm ci
+      - name: ESLint
+        run: npx eslint src/ --ext .ts,.tsx --max-warnings 0
+      - name: Prettier
+        run: npx prettier --check "src/**/*.{ts,tsx}"
+
+  typescript-test:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile/KoiApp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: mobile/KoiApp/package-lock.json
+      - run: npm ci
+      - name: Jest with coverage
+        run: |
+          npx jest --ci --coverage \
+            --coverageThreshold='{"global":{"branches":60,"functions":70,"lines":70,"statements":70}}'
+
+  # ============================================================================
+  # SUPABASE CHECKS
+  # ============================================================================
+  supabase-test:
+    needs: changes
+    if: needs.changes.outputs.supabase == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v1.x
+      - name: Lint
+        run: deno lint supabase/functions/
+      - name: Format check
+        run: deno fmt --check supabase/functions/
+      - name: Test
+        working-directory: supabase
+        run: deno test --allow-env --allow-net tests/
+
+  # ============================================================================
+  # SUMMARY — required status check for branch protection
+  # ============================================================================
+  pr-ready:
+    runs-on: ubuntu-latest
+    needs: [python-lint, python-test, typescript-lint, typescript-test, supabase-test]
+    if: always()
+    steps:
+      - name: Check required jobs
+        run: |
+          echo "Python lint: ${{ needs.python-lint.result }}"
+          echo "Python test: ${{ needs.python-test.result }}"
+          echo "TS lint: ${{ needs.typescript-lint.result }}"
+          echo "TS test: ${{ needs.typescript-test.result }}"
+          echo "Supabase test: ${{ needs.supabase-test.result }}"
+
+          # Fail if any required job failed (skipped is OK — means no changes in that area)
+          for result in \
+            "${{ needs.python-lint.result }}" \
+            "${{ needs.python-test.result }}" \
+            "${{ needs.typescript-lint.result }}" \
+            "${{ needs.typescript-test.result }}" \
+            "${{ needs.supabase-test.result }}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "FAILED: One or more required checks did not pass."
+              exit 1
+            fi
+          done
+
+          echo "All required checks passed (or were skipped due to no relevant changes)."
